@@ -60,8 +60,8 @@ def normalize(v):
 vmin = 0  #Beginning of frequency range
 vmax = 0  #End of frequency range
 # Path for the calculated and observed files
-calc_path = "ir_BLYP_DZ.xy"
-obsv_path = "ir_BP86_DZ.xy"  
+calc_path = "calc.xy"
+obsv_path = "obsv.xy"  
 hw = 4.     # Half-width
 resol = 1.  # Resolution of broadened spectra in n_points/cm-1
     
