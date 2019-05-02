@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jun  4 10:27:04 2018
+
+@author: tteodoro
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@author: Dr. Tiago Q. Teodoro
+@co-author: Prof. Dr. Lucas Visscher
+
+This code is used for combining two levels of theory in order to obtain
+the vibrational absorption and circular dichroism
+spectra for a given molecule.
+
+A previous vcd calculation is necessary for providing frequencies,
+normal modes, and electric and magnetic dipole grandients 
+through a RKF and/or T21 file.
+
+Recommended use is with one RKF and a T21 file in the same folder!
+@Janani: run it with only one RKF file in the folder.
+"""
+
+#############
+## Modules ##
+#############
+
+from scm import plams
+import numpy as np
+import os
+import sys
+
+
+#############
+## Classes ##
+#############
+
+class TAPE21():
+    """
+    Retrieves information from TAPE21 files 
+    required to run VCD or Hessian analysis.
+    """
+    def __init__(self, file):
+        self.file   = file
+        self.rkf    = plams.KFFile(file)
+        self.nAtoms = self.rkf['Geometry%nnuc']
+
+    def get_name(self):
+        return os.path.splitext(self.file)[0]       
+
+    def get_frequencies(self):
+        return np.array(self.rkf['Freq%Frequencies'])
+    
+    def get_coordinates(self):
+        return np.reshape(self.rkf['Geometry%xyz'],(self.nAtoms,3))
+    
+    def get_Hessian(self):
+        return np.reshape(self.rkf['Hessian%Analytical Hessian'],\
+                          (3*self.nAtoms,3*self.nAtoms))
+    
+    def get_APTs(self):
+        return np.reshape(self.rkf['Freq%DipoleDerivatives_RAW'],(3*self.nAtoms,3))
+    
+    def get_AATs(self):
+        return np.reshape(self.rkf['Freq Symmetry%AAT'],(self.nAtoms,3,3))
+    
+    def get_weightedModes(self):
+        return np.reshape(self.rkf['Freq%NormalModes_RAW'],\
+                          (3*self.nAtoms,3*self.nAtoms))
+    
+    def get_modes(self):
+        return (self.get_weightedModes() / np.sqrt(self.get_massArray()))
+    
+    def get_masses(self):
+        frag_type  = self.rkf['Geometry%nofrag_2']
+        mass_type  = self.rkf['Geometry%mass']
+        masses = np.zeros(self.nAtoms)
+        for atom in range(self.nAtoms):
+            masses[atom] = mass_type[frag_type[atom]-1]
+        return masses
+    
+    def get_massArray(self):
+        frag_type  = self.rkf['Geometry%nofrag_2']
+        mass_type  = self.rkf['Geometry%mass']
+        massArray = np.zeros(3*self.nAtoms)
+        for atom in range(self.nAtoms):
+            massArray[3*atom:(3*atom)+3] = mass_type[frag_type[atom]-1]
+        return massArray
+    
+    def get_gradients(self):
+        return self.rkf['GeoOpt%Gradients_InputOrder']
+    
+    def get_dipole(self):
+        return self.rkf['Properties%Dipole']
+    
+
+class RKF():
+    """
+    Retrieves information from RKF files 
+    required to run VCD or Hessian analysis
+    """
+    def __init__(self, file):
+        self.file   = file
+        self.rkf    = plams.KFFile(file)
+        self.nAtoms = self.rkf['Molecule%nAtoms']
+        self.nModes = len(self.rkf['Vibrations%Frequencies[cm-1]'])
+
+    def get_name(self):
+        return os.path.splitext(self.file)[0]       
+
+    def get_frequencies(self):
+        return np.array(self.rkf['Vibrations%Frequencies[cm-1]'])
+    
+    def get_coordinates(self):
+        return np.reshape(self.rkf['Molecule%Coords'],(self.nAtoms,3))
+    
+    def get_Hessian(self):
+        return np.reshape(self.rkf['AMSResults%Hessian'],\
+                          (3*self.nAtoms,3*self.nAtoms))
+    
+    def get_APTs(self):
+        return np.reshape(self.rkf['AMSResults%DipoleGradients'],\
+                          (3*self.nAtoms,3))
+    
+    def get_AATs(self):
+        return np.reshape(self.rkf['Vibrations%AtomicAxialTensors'],\
+                          (self.nAtoms,3,3))
+    
+    def get_weightedModes(self):
+        return (self.get_modes() * np.sqrt(self.get_massArray()))
+    
+    def get_modes(self):
+        return np.reshape(self.rkf['Vibrations%TransformationMatrix'],\
+                          (self.nModes,3*self.nAtoms))
+    
+    def get_masses(self):
+        return self.rkf['Molecule%AtomMasses']
+    
+    def get_massArray(self):
+        massArray = np.zeros(3*self.nAtoms)
+        for atom in range(self.nAtoms):
+            massArray[3*atom:(3*atom)+3] = self.get_masses()[atom]
+        return massArray
+    
+    def get_gradients(self):
+        return self.rkf['AMSResults%Gradients']
+
+
+
+###############
+## Functions ##
+###############
+        
+def rotatStr(vibFreq,normalModes,polarTens,axialTens):
+    """
+    Calculates a VCD spectra using the complete run through 
+    Stephens equations.
+    
+    vibFreq     -- vibrational frequencies
+    normalModes -- matrix transformation from Cartesian to normal coordinates
+    polartens   -- gradients of the electric dipole moment (APTs)
+    axialTens   -- gradients of the magnetic dipole moment (AATs)
+    
+    Returns: arrays with frequencies and rotational and dipole strengths.
+    """
+    
+    nAtoms = int(len(axialTens))
+    nModes = int(len(vibFreq))
+    
+    rotStren = np.zeros((2,nModes))
+    dipStren = np.zeros((2,nModes))
+    
+    rotStren[0,:] = vibFreq
+    dipStren[0,:] = vibFreq
+    
+    for nFreq in range(nModes):
+        elTensor = np.zeros(3)
+        mgTensor = np.zeros(3)
+        
+        for AAtom in range(nAtoms):
+            SnA    = normalModes[nFreq,AAtom*3:(AAtom+1)*3]
+                
+            for i in range(3):
+                duidRA = polarTens[AAtom*3:(AAtom+1)*3,i] 
+                
+                elTensor[i] = elTensor[i] + np.dot(duidRA, SnA)
+                mgTensor[i] = mgTensor[i] + np.dot(axialTens[AAtom,i,:],SnA)
+                
+        rotStren[1,nFreq] = np.dot(elTensor[:], mgTensor[:])
+        
+        if vibFreq[nFreq] > 0.0:
+            dipStren[1,nFreq] = np.dot(elTensor[:], elTensor[:]) \
+                                / vibFreq[nFreq]
+        else :
+            dipStren[1,nFreq] = 0.0
+        
+    # Unit conversion for 10^{-44} esu^2 cm^2
+    rotStren[1,:] *= 2586.254135396221624
+    # Unit conversion for 10^{-40} esu^2 cm^2
+    dipStren[1,:] *= 3892569.714886886399 
+    return rotStren, dipStren
+
+
+def dipoleStrength(vibFreq,normalModes,polarTens):
+    """
+    Calculates a VCD spectra using the complete run through 
+    Stephens equations.
+    
+    vibFreq     -- vibrational frequencies
+    normalModes -- matrix transformation from Cartesian to normal coordinates
+    polartens   -- gradients of the electric dipole moment (APTs)
+    
+    Returns: arrays with frequencies and rotational and dipole strengths.
+    """
+
+    nModes = int(len(vibFreq))
+    
+    dipStren = np.zeros((2,nModes))
+    dipStren[0,:] = vibFreq
+    
+    for nFreq in range(nModes):
+
+        elTensor = polarTens[:,nFreq]
+        
+        if vibFreq[nFreq] > 0.0:
+            dipStren[1,nFreq] = np.dot(elTensor[:], elTensor[:]) \
+                                / vibFreq[nFreq]
+        else :
+            dipStren[1,nFreq] = 0.0
+            
+    # Unit conversion for 10^{-40} esu^2 cm^2
+    dipStren[1,:] *= 3892569.714886886399 
+    return dipStren
+
+def MakeMWHessian (hessian,massArray):
+    """
+    Construct mass-weighted Hessian 
+    
+    Hessian   -- Hessian
+    massArray -- Array with 3 x each atomic mass
+    
+    Returns: arrays with fmass-weighted Hessian.
+    """
+    
+    nCoord      = len(massArray)
+    sqrtMass    = np.sqrt(massArray)
+    mwHessian   = np.empty_like(hessian)
+    
+    mwHessian = hessian / np.reshape (np.kron(sqrtMass,sqrtMass), \
+                                      (nCoord, nCoord)) 
+    return mwHessian
+
+
+def CalcNormalModes(mwHessian):
+    """
+    (Re)calculates normal modes 
+    
+    mwHessian  -- mass-weighted Hessian
+    
+    Returns: arrays with frequencies and normal modes.
+    """
+    
+    eigenvalues, eigenvectors = np.linalg.eigh(mwHessian)
+            
+    frequencies = np.sign(eigenvalues) * np.sqrt(np.abs(eigenvalues)) \
+                  * 5140.4633 # unit conversion to cm^1
+                  
+    # Note that we return the transpose (=Fortran ordering) of the eigenvectors
+    # to be consistent with what is read from kf-files!
+    return frequencies, np.transpose(eigenvectors)
+
+
+def NormalizeModes(modes):
+    """
+    Normalizes all modes of a given calculation and return these
+    normalized modes in an array with the same shape as the input.
+    """
+    nmodes = len(modes)
+    normalizedModes = np.empty_like(modes)
+    for i in range(nmodes):
+        norm = 0.0
+        for j in range(len(modes[i])):
+            norm += modes[i][j]**2
+        norm = np.sqrt(norm)
+#        print('Norm of mode {:5d}: {:20.15f}'.format(i,norm))
+        normalizedModes[i] = modes[i]/norm           
+    return normalizedModes
+
+
+def CalcOverlap(higLevel,lowLevel):
+    """
+    Compute and print overlaps between two sets of normal modes
+    """
+    baseMode = higLevel.get_weightedModes()
+    baseFreq = higLevel.get_frequencies()
+    baseName = higLevel.get_name()
+    projMode = lowLevel.get_weightedModes()
+    projFreq = lowLevel.get_frequencies()
+    projName = lowLevel.get_name()
+    
+    if len(baseMode) == len(projMode) + 6:
+        baseMode = baseMode[6:]
+        baseFreq = baseFreq[6:]
+        print ("WARNING: Base mode contains 6+ arrays than projected mode.")
+        print ("Base mode was sliced to exclude the first 6 elements,")
+        print ("which are assumed to be rigid motions.")
+        
+    print ("")
+    print ('-'*60)
+    print ('{:^34s}{:>6s}{:>10s}{:>10s}'\
+           .format('File','Index','Freq','Overlap'))
+    print ('-'*60)
+        
+    for i in range(len(baseMode)):
+        total_overlap = 0.0
+        for j in range(len(projMode)):
+            overlap = np.dot(baseMode[i],projMode[j])
+            total_overlap += overlap**2
+            if overlap > threshold or overlap < -threshold:
+                print ('{:<34s}{:>6d}  {:>8.0f}{:>10.3f}'\
+                       .format(projName,j+1,projFreq[j],overlap))
+        print ('{:<34s}{:>6.0f}  {:>8.0f}'.format(baseName,i+1,baseFreq[i]))
+        print ('{:<15s}{:>45.3f}'.format("Total overlap:",total_overlap))
+        print ('-'*60)
+
+
+def Lorentzian(x,x0,alpha):
+    "Lorentzian broadening for plotting the spectra"
+    return (1/np.pi) * alpha / ((x - x0)**2 + alpha**2) #alpha = half-width
+
+
+def simulated_vcd_spectrum(points,peaks):
+    "Generates the points to be plotted using the Gaussian function above"
+    halfwidth  = 4.         # fixed width for broadening
+    freqs  = peaks[0,:]     # Slice to take out the peak positions
+    intens = peaks[1,:]     # Slice to take out the peak heights
+    cspectrum = np.zeros_like(points)
+    for freq, intens in zip(freqs,intens):
+        cspectrum += Lorentzian(points,freq,halfwidth) * intens
+        
+    for freq in range(len(points)):
+        cspectrum[freq] *= (points[freq]/229600) 
+    return cspectrum
+
+
+def simulated_ir_spectrum(points,peaks):
+    "Generates the points to be plotted using the Gaussian function above"
+    halfwidth  = 4.         # fixed width for broadening
+    freqs  = peaks[0,:]     # Slice to take out the peak positions
+    intens = peaks[1,:]     # Slice to take out the peak heights
+    cspectrum = np.zeros_like(points)
+    for freq, intens in zip(freqs,intens):
+        cspectrum += Lorentzian(points,freq,halfwidth) * intens
+        
+    for freq in range(len(points)):
+        cspectrum[freq] *= (points[freq]/91.84) 
+    return cspectrum 
+
+
+def plot_spectra(name,dipStrength,rotStrength,xmin=0.0,xmax=4000.0,):
+    """
+    Plots IR and VCD spectra of a single level. Also prints a xy file
+    with peaks and frequencies to be used in any other program.
+    """
+    
+    points      = np.linspace(xmin, xmax, (xmax-xmin))
+    broaden_ir  = simulated_ir_spectrum(points,dipStrength)
+    broaden_vcd = simulated_vcd_spectrum(points,rotStrength)
+        
+    print ('-'*50)
+    print ('-'*50)
+    print ('File used for the spectra: {:<20s}\n'.format(name))
+    print ('{:^10s}{:^10s}{:^10s}{:^10s}'\
+           .format('Index','Freq.','DipStr','RotStr'))
+    print ('-'*40)
+    for i in range(len(rotStrength[0,:])):
+        if rotStrength[0,i] > 0:
+            print ('{:>8d}  {:>8.1f}  {:>8.1f}  {:>8.1f}'\
+                   .format(i,rotStrength[0,i],dipStrength[1,i],rotStrength[1,i]))
+    # Plots the spectra
+    plt.title(' {:10s} IR spectrum'.format(name))
+    plt.plot(points,broaden_ir,color='black')
+    plt.xlim(xmin,xmax)
+    plt.xlabel("Frequency (1/cm)")
+    plt.ylabel("Dipole Strength (1/cm 1/M)")
+#    plt.savefig(fname = 'ir_{}.png'.format(name),dpi=300)
+    plt.show()
+       
+    plt.title(' {:10s} VCD spectrum'.format(name))
+    plt.plot(points,broaden_vcd,color='black')
+    plt.xlim(xmin,xmax)
+    plt.xlabel("Frequency (1/cm)")
+    plt.ylabel("Rotational Strength (1/cm 1/M)")
+#    plt.savefig(fname = 'vcd_{}.png'.format(name),dpi=300)
+    plt.show()
+ 
+    print ()
+    print ('-'*40)
+    
+    
+def plot_combSpectra(dipStrenghts,rotStrenghts,xmin=0.,xmax=4000.):
+    """
+    Prints superimposing spectra (IR top and VCD bottom) of two levels.
+    The approximate level combines low level Hessian with high level tensors.
+    The exact level is the full high level calculation.
+    """
+
+    points = np.linspace(int(xmin), int(xmax), int(xmax-xmin))
+    
+    colors = ['black','red']
+    labels  = ['DFT','DFTB']
+    
+    plt.title('IR spectra')
+    plt.xlim(xmin,xmax)
+    plt.xlabel("Frequency (1/cm)")
+    plt.ylabel("Intensity (1/cm 1/M)")
+    for dipStrength, color, label in zip(dipStrengths, colors, labels):
+        broaden_ir  = simulated_ir_spectrum(points,dipStrength)
+        plt.plot(points,broaden_ir,color=color,label=label)
+#    plt.savefig(fname = 'comb_ir.png',dpi=300)
+    plt.show()
+
+  
+    plt.title('VCD spectra')
+    plt.xlim(xmin,xmax)
+    plt.xlabel("Frequency (1/cm)")
+    plt.ylabel("Rotational Strength (1/cm 1/M)")
+    for rotStrength, color in zip(rotStrengths, colors):
+         broaden_vcd = simulated_vcd_spectrum(points,rotStrength)   
+         plt.plot(points,broaden_vcd,color=color)
+#    plt.savefig(fname = 'comb_vcd.png',dpi=300)
+    plt.show()
+    
+    
+def export_peaks(name,rotStrength,dipStrength):
+    """
+    Create an xy file with frequencies and (IR and VCD) intensities.
+    These spectra can be used in any plotting program.
+    """
+    points      = np.linspace(0, 4000, 4000)
+    broaden_ir  = simulated_ir_spectrum(points,dipStrength)
+    broaden_vcd = simulated_vcd_spectrum(points,rotStrength)
+    
+    f = open('vcd_{}.txt'.format(name),'w')
+    for i in range(len(points)):
+        f.write('{} {}\n'.format(points[i],broaden_vcd[i]))
+    f.close()
+
+    f = open('ir_{}.txt'.format(name),'w')
+    for i in range(len(points)):
+        f.write('{} {}\n'.format(points[i],broaden_ir[i]))
+    f.close()
+    
+
+def query_yes_no(question, default="yes"):
+    """Ask a yes/no question via input() and return their answer.
+
+    "question" is a string that is presented to the user.
+    "default" is the presumed answer if the user just hits <Enter>.
+        It must be "yes" (the default), "no" or None (meaning
+        an answer is required of the user).
+
+    The "answer" return value is True for "yes" or False for "no".
+    """
+    valid = {"yes": True, "y": True, "ye": True,
+             "no": False, "n": False}
+    if default is None:
+        prompt = " [y/n] "
+    elif default == "yes":
+        prompt = " [Y/n] "
+    elif default == "no":
+        prompt = " [y/N] "
+    else:
+        raise ValueError("invalid default answer: '%s'" % default)
+
+    while True:
+        sys.stdout.write(question + prompt)
+        choice = input().lower()
+        if default is not None and choice == '':
+            return valid[default]
+        elif choice in valid:
+            return valid[choice]
+        else:
+            sys.stdout.write("Please respond with 'yes' or 'no' "
+                             "(or 'y' or 'n').\n")
+
+
+#######################
+## Loading variables ##
+#######################
+
+name, extension, rkfFiles = [], [], []
+
+for file in os.listdir("."):
+    if os.path.isfile(file):
+        if file.endswith(".t21"):
+            rkfFiles.append(TAPE21(file))  
+            t21 = plams.KFFile(file)
+            name.append(os.path.splitext(file)[0])
+            extension.append("TAPE21")
+
+          
+        elif file.endswith(".rkf"):
+            rkfFiles.append(RKF(file))
+            rkf = plams.KFFile(file)
+            name.append(os.path.splitext(file)[0])
+            extension.append("RKF")
+
+
+##########################
+## Interactive terminal ##
+##########################
+
+if not name:
+    print("There are no RKF or T21 files in this directory.")
+    sys.exit("You're probably in the wrong folder")
+elif len(name) == 1:
+    print("There is only one RKF/T21 file in this directory.")
+    print("The following data is obtained from this single file.")
+    rotStrength, dipStrength = \
+        rotatStr(rkfFiles[0].get_frequencies(), rkfFiles[0].get_modes(), \
+                 rkfFiles[0].get_APTs(), rkfFiles[0].get_AATs())
+    #plot_spectra(name[0],dipStrength,rotStrength,xmin=0.0,xmax=4000.0)
+    #export_peaks(name[0],rotStrength,dipStrength)
+elif len(name) > 2:
+    sys.exit("There are >2 T21/RKF files in this folder. You need to leave only 1 RKF")
+rotStrengths, dipStrengths = [None]*2,[None]*2
+rotStrengths[0], dipStrengths[0] = rotStrength, dipStrength
+print ('='*60,"\n")
+
+
+####### Recalculate some modes using ADF/PLAMS ########
+answer = 'yes'
+
+if (1==1):
+    fmin = 1500
+    fmax = 1850
+    ################### PLAMS CALCULATION #########################
+    plams.init()
+    
+    def adf_grads():
+        """
+        Settings for running gradients calculation
+        """
+        adf = plams.Settings()
+        adf.input.SYMMETRY = 'NOSYM'
+        adf.input.BASIS.type = 'DZ'
+        adf.input.BASIS.core = 'Large'
+        adf.input.XC.GGA = 'Becke Perdew'
+        #    adf.input.XC.dispersion = 'uff'
+        adf.input.RESTART.File = '/home/jnagaraj/ubi/dft/u_bp86_sp/TAPE21.t21'
+        adf.input.RESTART.nogeo = ''
+        adf.input.Gradient = ""
+        return adf
+    
+    ##### Specific for HNDT ##########
+    path_to_rkf = "/home/jnagaraj/oh_n7/dftb/oh_n7_3ob_gfv/oh_n7_3ob_gfv.ams.results/dftb.rkf"
+    mol = plams.Molecule("/home/jnagaraj/oh_n7/dftb/oh_n7_3ob_gfv/oh_n7_3ob_gfv.xyz")
+
+    # Creates array with size 3*N x nModes
+    V = np.transpose(rkfFiles[0].get_modes()[(rkfFiles[0].get_frequencies()>=fmin)*(rkfFiles[0].get_frequencies()<=fmax),:])
+    # Creates array with 3*N x nModes
+    numHess = np.empty([rkfFiles[0].nAtoms*3,len(V[1])])
+    # Creates array with 3 x nModes
+    polTens = np.empty([3,len(V[1])])
+    
+    # For each mode, calculate gradients at 1 points and save in numHess
+    for mode in range(len(V[1])):
+        vec          = np.copy(V[:,mode])
+        vec.shape    = (-1,3)
+        displacement = 0.01    # Size of largest displacement (in au)
+
+        # Finds the maximum displacement (largest mode norm)
+        max_norm     = 0.0 
+        for i in vec:
+            max_norm = max(max_norm, np.linalg.norm(i))
+        scaling = displacement / max_norm
+    
+        # Creates two structures with + and - displacements
+        mol_plus = mol.copy()
+        for at,i in zip(mol_plus,vec):
+            at.translate(i*scaling,'Bohr')
+            
+        mol_less = mol.copy()
+        for at,i in zip(mol_less,vec):
+            at.translate(-i*scaling,'Bohr')
+    
+        # Run the jobs with + displaced geometries
+        adf_job = plams.ADFJob(name='grad+_'+str(mode),molecule=mol_plus,settings=adf_grads())
+        jobres = adf_job.run()
+        # Retrieve the gradients and dipoles
+        grad_plus = np.asarray(jobres.readkf('GeoOpt','Gradients_InputOrder'))
+        dip_plus = np.asarray(jobres.readkf('Properties', 'Dipole'))
+        
+        # Run the jobs with - displaced geometries
+        adf_job = plams.ADFJob(name='grad-_'+str(mode),molecule=mol_less,settings=adf_grads())
+        jobres = adf_job.run()
+        # Retrieve the gradients and dipoles
+        grad_less = np.asarray(jobres.readkf('GeoOpt','Gradients_InputOrder'))
+        dip_less = np.asarray(jobres.readkf('Properties', 'Dipole'))
+
+        # Saves derivative of gradients in numHess
+        polTens[:,mode] = (dip_plus - dip_less) / (2*scaling)
+        numHess[:,mode] = (grad_plus - grad_less) / (2*scaling)
+        
+        plams.finish()
+        ################## END OF PLAMS ########################
+        
+        
+    # Same as in change of basis for a range of spectral region    
+    smallHess = (np.dot(np.transpose(V), (numHess)))
+    numFreq, numMode = CalcNormalModes(smallHess)
+    
+    smallPol = np.dot(numMode,np.transpose(polTens))
+    newNumMode = np.transpose(np.dot(V,np.transpose(numMode)))
+    
+    smallPol= np.transpose(smallPol)
+    
+    rotStrengths[1], dipStrengths[1] = rotatStr(numFreq, newNumMode, rkfFiles[0].get_APTs(), rkfFiles[0].get_AATs())
+    dipStrengths[1] = dipoleStrength(numFreq,newNumMode,smallPol)
+    export_peaks("modeselection",rotStrengths[1], dipStrengths[1])
+    
+    print ('Recalculated {:4d} out of {:4d} modes'.format(len(numFreq),len(rkfFiles[0].get_frequencies())))
